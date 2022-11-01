@@ -103,34 +103,33 @@ func (pool *Producer) Put(ctx context.Context, tube string, body []byte, params 
 	ctx, span := trace.StartSpan(ctx, "github.com/prep/beanstalk/Producer.Put")
 	defer span.End()
 
+	// Note that this loop is very experimental,
+	// If all connections are bad, it will occupy all producers available until the work is done.
 	for i := 0; i < cap(pool.producersCh); i++ {
-		id, err := func() (uint64, error) {
-			p, err := pool.getProducer(ctx)
-			if err != nil {
-				return 0, err
+		p, err := pool.getProducer(ctx)
+		if err != nil {
+			return 0, err
+		}
+		defer func() {
+			pool.mu.RLock()
+			if pool.producersCh == nil {
+				return
 			}
-			defer func() {
-				pool.mu.RLock()
-				pool.producersCh <- p
-				pool.mu.RUnlock()
-			}()
-
-			id, err := p.Put(ctx, tube, body, params)
-			// If the job is too big, assume it'll be too big for the other
-			// beanstalk producers as well and return the error.
-			if errors.Is(err, ErrTooBig) {
-				return 0, err
-			}
-			if err != nil {
-				return 0, nil
-			}
-
-			return id, nil
+			pool.producersCh <- p
+			pool.mu.RUnlock()
 		}()
-		if id == 0 && err == nil {
+
+		id, err := p.Put(ctx, tube, body, params)
+		// If the job is too big, assume it'll be too big for the other
+		// beanstalk producers as well and return the error.
+		if errors.Is(err, ErrTooBig) {
+			return 0, err
+		}
+		if err != nil {
 			continue
 		}
-		return id, err
+
+		return id, nil
 	}
 
 	return 0, ErrDisconnected
