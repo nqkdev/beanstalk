@@ -3,7 +3,6 @@ package beanstalk
 import (
 	"context"
 	"errors"
-	"math/rand"
 	"sync"
 
 	"go.opencensus.io/trace"
@@ -16,6 +15,8 @@ type Producer struct {
 	config    Config
 	producers []*producer
 	mu        sync.RWMutex
+
+	producersCh chan *producer
 }
 
 // NewProducer returns a new Producer.
@@ -31,6 +32,10 @@ func NewProducer(uris []string, config Config) (*Producer, error) {
 
 	// Create the pool and spin up the producers.
 	pool := &Producer{cancel: cancel, config: config.normalize()}
+
+	// Initialize producer buffered channel
+	pool.producersCh = make(chan *producer, len(uris)*pool.config.Multiply)
+
 	for _, uri := range multiply(uris, pool.config.Multiply) {
 		producer := &producer{errC: make(chan error, 1)}
 		go maintainConn(ctx, uri, pool.config, connHandler{
@@ -38,6 +43,7 @@ func NewProducer(uris []string, config Config) (*Producer, error) {
 		})
 
 		pool.producers = append(pool.producers, producer)
+		pool.producersCh <- producer
 	}
 
 	return pool, nil
@@ -51,6 +57,14 @@ func (pool *Producer) Stop() {
 	defer pool.mu.Unlock()
 
 	pool.producers = []*producer{}
+
+	producersCh := pool.producersCh
+	pool.producersCh = nil
+	if producersCh == nil {
+		return
+	}
+	close(producersCh)
+	// TODO: close producer connections?
 }
 
 // IsConnected returns true when at least one producer in the pool is connected.
@@ -67,30 +81,58 @@ func (pool *Producer) IsConnected() bool {
 	return false
 }
 
+func (pool *Producer) getProducer(ctx context.Context) (*producer, error) {
+	pool.mu.RLock()
+	producersCh := pool.producersCh
+	pool.mu.RUnlock()
+
+	if producersCh == nil {
+		return nil, ErrDisconnected
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case p := <-producersCh:
+		return p, nil
+	}
+}
+
 // Put a job into the specified tube.
 func (pool *Producer) Put(ctx context.Context, tube string, body []byte, params PutParams) (uint64, error) {
 	ctx, span := trace.StartSpan(ctx, "github.com/prep/beanstalk/Producer.Put")
 	defer span.End()
 
-	pool.mu.RLock()
-	defer pool.mu.RUnlock()
+	for i := 0; i < cap(pool.producersCh); i++ {
+		id, err := func() (uint64, error) {
+			p, err := pool.getProducer(ctx)
+			if err != nil {
+				return 0, err
+			}
+			defer func() {
+				pool.mu.RLock()
+				pool.producersCh <- p
+				pool.mu.RUnlock()
+			}()
 
-	// Cycle randomly over the producers.
-	for _, num := range rand.Perm(len(pool.producers)) {
-		id, err := pool.producers[num].Put(ctx, tube, body, params)
-		// If the job is too big, assume it'll be too big for the other
-		// beanstalk producers as well and return the error.
-		if errors.Is(err, ErrTooBig) {
-			return 0, err
-		}
-		if err != nil {
+			id, err := p.Put(ctx, tube, body, params)
+			// If the job is too big, assume it'll be too big for the other
+			// beanstalk producers as well and return the error.
+			if errors.Is(err, ErrTooBig) {
+				return 0, err
+			}
+			if err != nil {
+				return 0, nil
+			}
+
+			return id, nil
+		}()
+		if id == 0 && err == nil {
 			continue
 		}
-
-		return id, nil
+		return id, err
 	}
 
-	// If no producer was found, all were disconnected.
 	return 0, ErrDisconnected
 }
 
