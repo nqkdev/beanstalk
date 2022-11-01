@@ -93,7 +93,10 @@ func (pool *Producer) getProducer(ctx context.Context) (*producer, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case p := <-producersCh:
+	case p, done := <-producersCh:
+		if !done {
+			return nil, ErrDisconnected
+		}
 		return p, nil
 	}
 }
