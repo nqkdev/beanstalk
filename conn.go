@@ -410,15 +410,22 @@ func (conn *Conn) Put(ctx context.Context, tube string, body []byte, params PutP
 
 	// If the tube is different than the last time, switch tubes.
 	if tube != conn.lastTube {
-		if _, _, err := conn.command(ctx, "use %s", tube); err != nil {
+		if err := conn.use(ctx, tube); err != nil {
 			return 0, err
 		}
-
 		conn.lastTube = tube
 	}
 
 	id, _, err := conn.command(ctx, "put %d %d %d %d\r\n%s", params.Priority, params.Delay/time.Second, params.TTR/time.Second, len(body), body)
 	return id, err
+}
+
+func (conn *Conn) use(ctx context.Context, tube string) error {
+	ctx, span := trace.StartSpan(ctx, "github.com/prep/beanstalk/Conn.use")
+	defer span.End()
+
+	_, _, err := conn.command(ctx, "use %s", tube)
+	return err
 }
 
 func (conn *Conn) release(ctx context.Context, job *Job, priority uint32, delay time.Duration) error {
