@@ -37,13 +37,13 @@ func NewProducer(uris []string, config Config) (*Producer, error) {
 	pool.producersCh = make(chan *producer, len(uris)*pool.config.Multiply)
 
 	for _, uri := range multiply(uris, pool.config.Multiply) {
-		producer := &producer{errC: make(chan error, 1)}
+		p := &producer{errC: make(chan error, 1)}
 		go maintainConn(ctx, uri, pool.config, connHandler{
-			handle: producer.setConnection,
+			handle: p.setConnection,
 		})
 
-		pool.producers = append(pool.producers, producer)
-		pool.producersCh <- producer
+		pool.producers = append(pool.producers, p)
+		pool.producersCh <- p
 	}
 
 	return pool, nil
@@ -59,11 +59,10 @@ func (pool *Producer) Stop() {
 	pool.producers = []*producer{}
 
 	producersCh := pool.producersCh
-	pool.producersCh = nil
-	if producersCh == nil {
-		return
+	if producersCh != nil {
+		pool.producersCh = nil
+		close(producersCh)
 	}
-	close(producersCh)
 	// TODO: close producer connections?
 }
 
@@ -72,8 +71,8 @@ func (pool *Producer) IsConnected() bool {
 	pool.mu.RLock()
 	defer pool.mu.RUnlock()
 
-	for _, producer := range pool.producers {
-		if producer.isConnected() {
+	for _, p := range pool.producers {
+		if p.isConnected() {
 			return true
 		}
 	}
@@ -115,11 +114,11 @@ func (pool *Producer) Put(ctx context.Context, tube string, body []byte, params 
 		}
 		defer func() {
 			pool.mu.RLock()
-			if pool.producersCh == nil {
-				return
+			defer pool.mu.RUnlock()
+
+			if pool.producersCh != nil {
+				pool.producersCh <- p
 			}
-			pool.producersCh <- p
-			pool.mu.RUnlock()
 		}()
 
 		id, err := p.Put(ctx, tube, body, params)
@@ -169,7 +168,7 @@ func (producer *producer) isConnected() bool {
 	producer.mu.RLock()
 	defer producer.mu.RUnlock()
 
-	return (producer.conn != nil)
+	return producer.conn != nil
 }
 
 // Put inserts a job into beanstalk.
